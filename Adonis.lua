@@ -2,7 +2,7 @@
 
 local scripts = {
     [120219252362013] =
-        "https://raw.githubusercontent.com/caubebietbuon/Adonis-TFFA/main/Adonis-TFFA.lua",
+        "https://raw.githubusercontent.com/caubebietbuon/Misozz/main/Adonis-TFFA.lua",
 }
 
 local url = scripts[game.PlaceId]
