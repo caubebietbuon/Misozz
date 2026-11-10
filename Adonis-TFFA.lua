@@ -9,7 +9,20 @@ return function(ctx)
 local session
 local nextRetry=0
 local process,ensureDrain,onFailure
+local seedPlot,seedPlots,watchRoot
 local ownerKeys={OwnerUserId=true,OwnerId=true,Owner=true,PlayerUserId=true}
+local invisibleParticles=NumberSequence.new(1)
+local function sameValue(a,b)
+    if a==b then return true end
+    if typeof(a)~="NumberSequence" or typeof(b)~="NumberSequence" then return false end
+    local ak,bk=a.Keypoints,b.Keypoints
+    if #ak~=#bk then return false end
+    for i,key in ipairs(ak) do
+        local other=bk[i]
+        if key.Time~=other.Time or key.Value~=other.Value or key.Envelope~=other.Envelope then return false end
+    end
+    return true
+end
 local function inWorld(obj)
     local p=obj
     while p do if p==workspace then return true end; p=p.Parent end
@@ -31,7 +44,7 @@ local function ownership(obj)
     end
     if plot and ctx.plotOwner then
         local record=session.plotOwners[plot]
-        if not record then record={ctx.plotOwner(plot)}; session.plotOwners[plot]=record end
+        if not record then record={ctx.plotOwner(plot,session.roster)}; session.plotOwners[plot]=record end
         local id=record[1]
         if id==ctx.player.UserId then return false end
         if plotPet and id and session.players[id] and not localScope then return true end
@@ -57,8 +70,11 @@ end
 local function restore(obj,properties)
     for property,record in pairs(properties) do
         if record.connection then record.connection:Disconnect() end
-        pcall(function() if obj[property]==record.forced then obj[property]=record.original end end)
+        pcall(function() if sameValue(obj[property],record.forced) then obj[property]=record.original end end)
     end
+end
+local function disconnectAll(list)
+    for _,connection in pairs(list) do connection:Disconnect() end
 end
 local function release()
     local s=session; session=nil
@@ -66,10 +82,13 @@ local function release()
     if s.drain then s.drain:Disconnect(); s.drain=nil end
     for _,connection in ipairs(s.connections) do connection:Disconnect() end
     for _,connection in pairs(s.models) do connection:Disconnect() end
+    for _,map in ipairs({s.scopes,s.plotChildren,s.rootNames,s.rootSlots,s.playerWatches}) do
+        for _,connections in pairs(map) do disconnectAll(connections) end
+    end
     for obj,properties in pairs(s.records) do restore(obj,properties) end
 end
 local function enqueue(s,obj,urgent)
-    if obj then
+    if obj and session==s then
         local queue=urgent and s.priority or s.normal
         local existing=s.queued[obj]
         if existing==queue or existing==s.priority then return end
@@ -90,18 +109,70 @@ local function pop(s)
     s.queued[obj]=nil
     return obj,true,q==s.priority
 end
-local function seedPlot(s,plot)
+local function watchContainer(s,obj)
+    if not obj or s.scopes[obj] then return end
+    local function refresh()
+        enqueue(s,obj,true)
+        if s.shallow[obj] then seedPlot(s,obj) end
+    end
+    local function changed(child) enqueue(s,child,true) end
+    s.scopes[obj]={obj.DescendantAdded:Connect(changed),obj.DescendantRemoving:Connect(changed),
+        obj:GetPropertyChangedSignal("Parent"):Connect(refresh),obj:GetPropertyChangedSignal("Name"):Connect(refresh)}
+end
+local function watchPlotChildren(s,plot)
+    if s.plotChildren[plot] then return end
+    local list={}; s.plotChildren[plot]=list
+    local childNames={}
+    local function added(child)
+        if not childNames[child] then
+            childNames[child]=child:GetPropertyChangedSignal("Name"):Connect(function()
+                enqueue(s,child,true); seedPlot(s,plot)
+            end)
+        end
+        enqueue(s,child,true); seedPlot(s,plot)
+    end
+    list[1]=plot.ChildAdded:Connect(added)
+    list[2]=plot.ChildRemoved:Connect(function(child)
+        if childNames[child] then childNames[child]:Disconnect(); childNames[child]=nil end
+        enqueue(s,child,true); seedPlot(s,plot)
+    end)
+    list[3]={Disconnect=function() disconnectAll(childNames) end}
+    for _,child in ipairs(plot:GetChildren()) do added(child) end
+end
+seedPlot=function(s,plot)
     if not plot then return end
+    s.plotOwners[plot]=nil
     s.shallow[plot]=true
+    watchContainer(s,plot)
+    watchPlotChildren(s,plot)
+    local animals=plot:FindFirstChild("Animals")
+    watchContainer(s,animals)
     enqueue(s,plot,true)
     enqueue(s,plot:FindFirstChild("OwnerTag"),true)
-    enqueue(s,plot:FindFirstChild("Animals"),true)
+    enqueue(s,animals,true)
 end
-local function seedPlots(s,plots)
+seedPlots=function(s,plots)
     if not plots then return end
     s.seededRoots[plots]=true
     s.shallow[plots]=true
+    watchRoot(s,plots)
+    if not s.rootSlots[plots] then
+        s.rootSlots[plots]={plots.ChildAdded:Connect(function(plot) seedPlot(s,plot) end),
+            plots.ChildRemoved:Connect(function(plot) enqueue(s,plot,true) end)}
+    end
     for _,plot in ipairs(plots:GetChildren()) do seedPlot(s,plot) end
+end
+watchRoot=function(s,obj)
+    if s.rootNames[obj] or not (obj:IsA("Model") or obj:IsA("Folder")) then return end
+    local function changed()
+        if obj.Parent==workspace and obj.Name=="Plots" then seedPlots(s,obj)
+        elseif s.seededRoots[obj] then
+            s.seededRoots[obj],s.shallow[obj]=nil,nil
+            for _,plot in ipairs(obj:GetChildren()) do seedPlot(s,plot) end
+            enqueue(s,obj,true)
+        end
+    end
+    s.rootNames[obj]={obj:GetPropertyChangedSignal("Name"):Connect(changed),obj:GetPropertyChangedSignal("Parent"):Connect(changed)}
 end
 local function plotAncestor(obj)
     local p=obj
@@ -114,14 +185,22 @@ local function targets(obj)
     local hidden=inWorld(obj) and ownership(obj)
     local result={}
     if obj==ctx.services.Lighting then result.GlobalShadows=false end
+    if obj:IsA("BasePart") then result.CastShadow=false end
     if obj:IsA("Light") or obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then result.Shadows=false end
     if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam")
+        or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles")
         or obj:IsA("BlurEffect") or obj:IsA("BloomEffect") or obj:IsA("SunRaysEffect")
         or obj:IsA("DepthOfFieldEffect") then result.Enabled=false end
+    if obj:IsA("Explosion") then result.Visible=false end
+    -- Enabled alone does not hide explicit Emit() bursts or particles already
+    -- alive. Mask their drawing without clearing/destroying the emitter.
+    if obj:IsA("ParticleEmitter") then result.Transparency=invisibleParticles; result.Rate=0 end
+    if obj:IsA("Smoke") then result.Opacity=0 end
     if hidden then
         if obj:IsA("BasePart") then result.LocalTransparencyModifier=1 end
         if obj:IsA("Decal") or obj:IsA("Texture") then result.Transparency=1 end
         if obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then result.Enabled=false end
+        if obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then result.Enabled=false end
     end
     return result
 end
@@ -139,7 +218,7 @@ local function apply(s,obj,desired)
                 record.connection=obj:GetPropertyChangedSignal(property):Connect(function()
                     if session~=s or record.writing then return end
                     local current=obj[property]
-                    if current==record.forced then return end
+                    if sameValue(current,record.forced) then return end
                     record.original=current; record.writing=true
                     obj[property]=record.forced; record.writing=false
                 end)
@@ -150,13 +229,16 @@ local function apply(s,obj,desired)
     s.records[obj]=next(properties) and properties or nil
 end
 local function begin()
-    local s={normal=queue(),priority=queue(),queued={},shallow={},seededRoots={},records={},models={},connections={}}
+    local s={normal=queue(),priority=queue(),queued={},shallow={},seededRoots={},records={},models={},connections={},
+        plotOwners={},scopes={},plotChildren={},rootNames={},rootSlots={},playerWatches={},identities={},departing={}}
     session=s
     -- Do not make pet visuals wait behind tens of thousands of biome parts.
     seedPlots(s,workspace:FindFirstChild("Plots"))
+    for _,obj in ipairs(workspace:GetChildren()) do watchRoot(s,obj) end
     apply(s,ctx.services.Lighting,{GlobalShadows=false})
     enqueue(s,workspace); enqueue(s,ctx.services.Lighting)
     local function added(obj)
+        if obj.Parent==workspace then watchRoot(s,obj) end
         local plot=plotAncestor(obj)
         if plot then
             enqueue(s,obj,true)
@@ -168,13 +250,39 @@ local function begin()
     table.insert(s.connections,workspace.DescendantRemoving:Connect(added))
     table.insert(s.connections,ctx.services.Lighting.DescendantAdded:Connect(added))
     table.insert(s.connections,ctx.services.Lighting.DescendantRemoving:Connect(added))
+    local function rosterChanged()
+        for plot in pairs(s.plotChildren) do seedPlot(s,plot) end
+        for model in pairs(s.identities) do enqueue(s,model,true) end
+    end
+    local function watchPlayer(player)
+        if s.playerWatches[player] or type(player.GetPropertyChangedSignal)~="function" then return end
+        s.playerWatches[player]={player:GetPropertyChangedSignal("Name"):Connect(rosterChanged),
+            player:GetPropertyChangedSignal("DisplayName"):Connect(rosterChanged)}
+    end
+    local players=ctx.services.Players
+    if players.PlayerAdded then
+        s.connections[#s.connections+1]=players.PlayerAdded:Connect(function(player)
+            s.departing[player.UserId]=nil; watchPlayer(player); rosterChanged()
+        end)
+    end
+    if players.PlayerRemoving then
+        s.connections[#s.connections+1]=players.PlayerRemoving:Connect(function(player)
+            s.departing[player.UserId]=true
+            if s.playerWatches[player] then disconnectAll(s.playerWatches[player]); s.playerWatches[player]=nil end
+            rosterChanged()
+        end)
+    end
+    for _,player in ipairs(players:GetPlayers()) do watchPlayer(player) end
 end
 process=function(s,priorityOnly,seconds,limit)
     local deadline=os.clock()+seconds
     s.plotOwners={}
-    s.players,s.names={},{}
+    s.players,s.names,s.roster={},{},{}
     for _,player in ipairs(ctx.services.Players:GetPlayers()) do
-        s.players[player.UserId]=true; s.names[player.Name]=player.UserId
+        if not s.departing[player.UserId] then
+            s.players[player.UserId]=true; s.names[player.Name]=player.UserId
+            s.roster[#s.roster+1]=player
+        end
     end
     if not priorityOnly and workspace.CurrentCamera~=s.camera then s.camera=workspace.CurrentCamera; enqueue(s,s.camera) end
     -- Spend a bounded slice on urgent pet work; map decorations get only the
@@ -194,6 +302,9 @@ process=function(s,priorityOnly,seconds,limit)
             local present=inWorld(obj) or obj==ctx.services.Lighting or obj.Parent==ctx.services.Lighting
                 or obj==s.camera or obj.Parent==s.camera
             if present then
+                if obj:IsA("Model") then
+                    s.identities[obj]=(obj:GetAttribute("AnimalId")~=nil or obj:GetAttribute("AnimalName")~=nil) and not plotAncestor(obj) or nil
+                end
                 if obj.Name=="OwnerTag" and obj.Parent and obj.Parent.Parent
                     and obj.Parent.Parent.Name=="Plots" and not s.models[obj]
                     and ctx.watchPlotTag then
@@ -211,8 +322,12 @@ process=function(s,priorityOnly,seconds,limit)
             else
                 if s.records[obj] then restore(obj,s.records[obj]); s.records[obj]=nil end
                 if s.models[obj] then s.models[obj]:Disconnect(); s.models[obj]=nil end
+                for _,map in ipairs({s.scopes,s.plotChildren,s.rootNames,s.rootSlots}) do
+                    if map[obj] then disconnectAll(map[obj]); map[obj]=nil end
+                end
+                s.identities[obj]=nil
             end
-            if not s.shallow[obj] then
+            if not s.shallow[obj] or not present then
                 for _,child in ipairs(obj:GetChildren()) do
                     if child.Name=="Plots" and child.Parent==workspace then
                         if not s.seededRoots[child] then seedPlots(s,child) end
@@ -410,7 +525,7 @@ task.spawn(function()
                 -- The game accepts screen taps during the inter-prompt transition,
                 -- including when ThrowSequence.Text is temporarily destroyed.
                 local transition = not obj and ctx.state.cinemaPending
-                    and ctx.state.cinemaContinueSerial == 0
+                    and (ctx.state.cinemaObserved or ctx.state.cinemaContinueSerial>0)
                     and not hudVisible
                 if transition then kind = "transition" end
                 local ready = os.clock()-lastTap >= 0.75
@@ -424,18 +539,11 @@ task.spawn(function()
                     if not camera then return end
                     -- The prompt at the bottom can extend beyond the viewport.
                     -- Tap a clear in-bounds point; the game's cinema listens to screen input.
-                    local size = camera.ViewportSize
-                    -- The probe recorded successful manual taps near (0.606W, 0.472H).
-                    local x, y = size.X*0.6, size.Y*0.47
-                    local oldPanelVisible = ctx.view.panel.Visible
-                    local pp, ps = ctx.view.panel.AbsolutePosition, ctx.view.panel.AbsoluteSize
-                    local overlapsHub = oldPanelVisible and x >= pp.X and x <= pp.X+ps.X
-                        and y >= pp.Y and y <= pp.Y+ps.Y
-                    if overlapsHub then ctx.view.panel.Visible = false end
+                    local x,y=ctx.clearTapPoint()
+                    if not x then return end
                     -- Set the retry deadline even if the selected input API fails.
                     lastObj, lastKind, lastTap = obj, kind, os.clock()
                     local clicked, clickError = pcall(ctx.cinemaTap, x, y, method)
-                    if ctx.state.alive and overlapsHub then ctx.view.panel.Visible = oldPanelVisible end
                     if not clicked then error(clickError, 0) end
                     if kind == "continue" then
                         ctx.state.cinemaContinueSerial = ctx.state.cinemaContinueSerial+1
@@ -815,22 +923,74 @@ local function releaseTraining()
 end
 function ctx.runOptional(name,action)
     if not ctx.actionActive(name) then return false end
+    local previous,previousRevision=ctx.state.actionFeature,ctx.state.actionRevision
     ctx.state.actionFeature,ctx.state.actionRevision=name,ctx.state.controlRevision
     ctx.log("STEP_BEGIN",name)
     local ok,err=xpcall(action,debug.traceback)
     local cancelled=not ctx.actionActive(name)
-    ctx.state.actionFeature,ctx.state.actionRevision=nil,nil
-    if not ok and cancelled then
-        ctx.log("STEP_CANCELLED",name)
+    ctx.state.actionFeature,ctx.state.actionRevision=previous,previousRevision
+    if not ok and cancelled then ctx.log("STEP_CANCELLED",name)
     elseif not ok and ctx.state.running then
         ctx.log("STEP_ERROR",name..": "..tostring(err))
         ctx.say(name.." interrupted; retrying enabled features")
     elseif ok then ctx.log("STEP_END",name) end
     return ok
 end
+local purchaseNames={"Upgrade","PlotUpgrade","Food"}
+local readyMethods={Upgrade="trainingUpgradeReady",PlotUpgrade="plotUpgradeReady",Food="foodReady"}
+local purchaseActions={Upgrade="doUpgrade",PlotUpgrade="doPlotUpgrade",Food="doFood"}
+local nextPurchaseCheck=0
+local nextInterruptCheck,interruptReady=0,false
+function ctx.requestPurchase(name)
+    ctx.state.purchaseUrgent=true
+    nextInterruptCheck=0
+    if name=="Food" and ctx.state.allInOneTurn then ctx.state.allInOneTurn.foodBought=false end
+end
+function ctx.purchaseInterruptReady()
+    if not ctx.state.purchaseUrgent or ctx.state.purchaseServicing or ctx.state.throwSessionActive
+        or ctx.state.cinemaPending or ctx.cinemaPrompt() then return false end
+    if os.clock()<nextInterruptCheck then return interruptReady end
+    nextInterruptCheck=os.clock()+0.25; interruptReady=false
+    for _,name in ipairs(purchaseNames) do
+        if cfg[name] and ctx[readyMethods[name]] then
+            local ok,ready=pcall(ctx[readyMethods[name]])
+            if ok and ready then interruptReady=true; break end
+        end
+    end
+    return interruptReady
+end
+function ctx.servicePurchases(force)
+    if not ctx.state.alive or not ctx.state.running or ctx.state.purchaseServicing
+        or ctx.state.throwSessionActive or ctx.state.cinemaPending or ctx.cinemaPrompt()
+        or ctx.visible(ctx.ui("ThrowSequence.Meter.Bar")) then return false end
+    local batch=cfg.AllInOne and ctx.state.allInOneTurn
+    if batch and batch.phase=="throw" and batch.completed<batch.target then return false end
+    if not force and not ctx.state.purchaseUrgent and os.clock()<nextPurchaseCheck then return false end
+    ctx.state.purchaseUrgent=false
+    nextPurchaseCheck=os.clock()+1
+    ctx.state.purchaseServicing=true
+    local serviced=false
+    for _,name in ipairs(purchaseNames) do
+        if not ctx.state.alive or not ctx.state.running or ctx.state.cinemaPending or ctx.cinemaPrompt() then break end
+        local ready=ctx[readyMethods[name]]
+        local turn=cfg.AllInOne and ctx.state.allInOneTurn
+        if cfg[name] and ready and not (name=="Food" and turn and turn.foodBought) then
+            local ok,affordable=pcall(ready)
+            if ok and affordable then
+                serviced=true
+                local before=ctx.state.foodPurchaseSerial or 0
+                ctx.runOptional(name,ctx[purchaseActions[name]])
+                if name=="Food" and turn and (ctx.state.foodPurchaseSerial or 0)>before then turn.foodBought=true end
+            end
+        end
+    end
+    ctx.state.purchaseServicing=false
+    return serviced
+end
 function ctx.halt(message)
     for _,key in ipairs(actionKeys) do cfg[key]=false end
     ctx.state.allInOneTurn=nil
+    ctx.state.purchaseUrgent=false
     ctx.state.controlRevision=ctx.state.controlRevision+1
     ctx.state.running=false
     ctx.refreshMenuState()
@@ -861,9 +1021,10 @@ local function cycle()
         return
     end
     ctx.runOptional("Equip",ctx.doEquip)
+    if ctx.featureEnabled("Train") or ctx.state.purchaseUrgent then ctx.servicePurchases() end
     if not current() then return end
     if ctx.featureEnabled("Train") and (not turn or turn.phase=="train") then
-        local other=cfg.AllInOne or cfg.Throw or cfg.Upgrade or cfg.PlotUpgrade or cfg.Food or cfg.Sell
+        local other=cfg.AllInOne or cfg.Throw or cfg.Sell
         local ok=ctx.runOptional("Train",function() ctx.doTrain(turn and turn.seconds or (other and cfg.TrainSeconds or math.huge)) end)
         if not ok or not current() then releaseTraining(); return end
     end
@@ -871,6 +1032,7 @@ local function cycle()
     releaseTraining()
     if not current() then return end
     local turns=turn and math.max(0,turn.target-turn.completed) or 1
+    ctx.state.throwSessionActive=ctx.featureEnabled("Throw")
     for i=1,turns do
         if not current() then return end
         if ctx.featureEnabled("Throw") then
@@ -878,18 +1040,18 @@ local function cycle()
             if turn then turn.beforeThrow=before end
             local ok=ctx.runOptional("Throw",ctx.doThrow)
             countThrow()
-            if not ok or ctx.state.completedThrows<=before then return end
+            if not ok or ctx.state.completedThrows<=before then ctx.state.throwSessionActive=false; return end
         end
         if current() then ctx.runOptional("Equip",ctx.doEquip) end
     end
     if not current() then return end
+    ctx.state.throwSessionActive=false
+    if ctx.state.purchaseUrgent then ctx.servicePurchases(true) end
+    if not current() then return end
     ctx.runOptional("Sell",ctx.doSell)
     if not current() then return end
-    ctx.runOptional("Upgrade",ctx.doUpgrade)
-    if not current() then return end
-    ctx.runOptional("PlotUpgrade",ctx.doPlotUpgrade)
-    if not current() then return end
-    ctx.runOptional("Food",ctx.doFood)
+    ctx.state.throwSessionActive=false
+    ctx.servicePurchases(true)
     if turn and current() then ctx.state.allInOneTurn=nil end
 end
 function ctx.syncAutomation()
@@ -907,7 +1069,10 @@ function ctx.syncAutomation()
     ctx.state.busy=true
     task.spawn(function()
         while ctx.state.alive and ctx.state.running do
+            ctx.state.throwSessionActive=false
             local ok,err=xpcall(cycle,debug.traceback)
+            ctx.state.throwSessionActive=false
+            ctx.state.purchaseServicing=false
             ctx.state.actionFeature,ctx.state.actionRevision=nil,nil
             releaseTraining()
             if not ok and ctx.state.alive and ctx.state.running then
@@ -915,7 +1080,7 @@ function ctx.syncAutomation()
             end
             local revision=ctx.state.controlRevision
             local deadline=os.clock()+(ok and 1 or 3)
-            while ctx.state.alive and ctx.state.running and revision==ctx.state.controlRevision and os.clock()<deadline do
+            while ctx.state.alive and ctx.state.running and revision==ctx.state.controlRevision and not ctx.state.purchaseUrgent and os.clock()<deadline do
                 task.wait(0.1)
             end
         end
@@ -923,20 +1088,20 @@ function ctx.syncAutomation()
         ctx.state.busy=false
     end)
 end
-local description="Auto Trainning -> auto tap x2 -> Throw food -> Equip best -> upgrade trainning bar -> buy next food ."
+local description="Auto Trainning -> Tap X2 -> Throw Food"
 local toggles={
-    {"AllInOne","Auto All In One",description,'Main Farm',0,{height=86}},
-    {"Train","Auto Train",nil,'Main Farm',264,{height=48}},
-    {"X2","Auto Tap X2",nil,'Main Farm',320,{height=48}},
-    {"Throw","Auto Throw Food ( Full Power )",nil,'Main Farm',184,{height=48}},
-    {"Equip","Equip Best",nil,'Main Farm',400,{height=48}},
-    {"HideCinema","Hide Cinema",nil,'Main Farm',456,{height=48}},
-    {"Upgrade","Upgrade Training Bar",nil,'Upgrade',36,{height=64}},
-    {"PlotUpgrade","Auto Upgrade Plot",nil,'Upgrade',112,{height=64}},
-    {"Food","Buy Next Food",nil,'Upgrade',240,{height=64}},
-    {"Sell","Auto Sell All Backpack",nil,'Auto Sell',36,{height=64}},
-    {"BoostFPS","Hide Others Pets",nil,'Setting',36,{height=64}},
-    {"AutoSaveConfig","Auto Save Config",nil,'Setting',164,{height=64}},
+    {"AllInOne","Auto All In One",description,'Main Farm',0,{height=78}},
+    {"Train","Auto Train",nil,'Main Farm',156,{height=48}},
+    {"X2","Auto Tap X2",nil,'Main Farm',212,{height=48}},
+    {"Throw","Auto Throw Food ( Full Power )",nil,'Main Farm',268,{height=48}},
+    {"Equip","Equip Best",nil,'Main Farm',324,{height=48}},
+    {"HideCinema","Hide Cinema",nil,'Main Farm',380,{height=48}},
+    {"Upgrade","Upgrade Training Bar",nil,'Upgrade',0,{height=64}},
+    {"PlotUpgrade","Auto Upgrade Plot",nil,'Upgrade',76,{height=64}},
+    {"Food","Buy Next Food",nil,'Upgrade',152,{height=64}},
+    {"Sell","Auto Sell All Backpack",nil,'Auto Sell',0,{height=64}},
+    {"BoostFPS","Boost FPS",nil,'Setting',0,{height=64}},
+    {"AutoSaveConfig","Auto Save Config",nil,'Setting',76,{height=64}},
 }
 for _,item in ipairs(toggles) do
     local key=item[1]
@@ -952,7 +1117,9 @@ for _,item in ipairs(toggles) do
         ctx.refreshToggle(b,cfg[key])
         if key=="BoostFPS" then ctx.updateBoostFPS() end
         if key~="HideCinema" and key~="BoostFPS" and key~="AutoSaveConfig" then
-            if key~="X2" and key~="Equip" then ctx.state.controlRevision=ctx.state.controlRevision+1 end
+            if key=="Upgrade" or key=="PlotUpgrade" or key=="Food" then
+                if cfg[key] then ctx.requestPurchase(key) end
+            elseif key~="X2" and key~="Equip" then ctx.state.controlRevision=ctx.state.controlRevision+1 end
             ctx.syncAutomation()
             if key=="Equip" and cfg.Equip and ctx.state.running then
                 local ok,err=pcall(ctx.doEquip)
@@ -974,22 +1141,14 @@ local function number(key,title,x,min,max)
         end
         box.Text=tostring(cfg[key])
     end
-    box=ctx.addNumber(title,nil,ctx.view.pages['Main Farm'],96,cfg[key],{
-        x=x,width=330,height=56})
+    box=ctx.addNumber(title,nil,ctx.view.pages['Main Farm'],88,cfg[key],{
+        x=x,width=282,height=56})
     ctx.view.controls[key]=box
     table.insert(ctx.connections,box.FocusLost:Connect(function() commit(tonumber(box.Text)) end))
 end
-number("TrainSeconds","Training Time (Seconds)",0,5,3600)
-number("ThrowsPerTurn","Throws Per Turn",342,1,100)
-ctx.addSection("Throw",ctx.view.pages['Main Farm'],160)
-ctx.addSection("Training",ctx.view.pages['Main Farm'],240)
-ctx.addSection("Animals & Cinema",ctx.view.pages['Main Farm'],376)
-ctx.addSection("Training & Plot",ctx.view.pages.Upgrade,0)
-ctx.addSection("Food",ctx.view.pages.Upgrade,204)
-ctx.addSection("Backpack",ctx.view.pages['Auto Sell'],0)
-ctx.addSection("Appearance",ctx.view.pages.Setting,0)
-ctx.addSection("Preferences",ctx.view.pages.Setting,128)
-for name,height in pairs({['Main Farm']=510,Upgrade=316,['Auto Sell']=112,Setting=240}) do
+number("TrainSeconds","Training Time (Seconds)",4,5,3600)
+number("ThrowsPerTurn","Throws Per Turn",298,1,100)
+for name,height in pairs({['Main Farm']=444,Upgrade=228,['Auto Sell']=76,Setting=152}) do
     ctx.view.pages[name].CanvasSize=UDim2.fromOffset(0,height)
 end
 end
@@ -1013,10 +1172,19 @@ local function ui(...) return ctx.ui(...) end
 local function visible(...) return ctx.visible(...) end
 
 local drag={active=false}
+local launcherDrag={active=false,suppressClick=false}
 ctx.view.dragState=drag
+ctx.view.launcherDrag=launcherDrag
 table.insert(connections, ctx.view.dragHeader.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         drag.active,drag.input,drag.origin,drag.position=true,input,input.Position,ctx.view.panel.Position
+    end
+end))
+table.insert(connections, ctx.view.reopen.InputBegan:Connect(function(input)
+    if not ctx.view.menuOpen and (input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch) then
+        drag.active=false
+        launcherDrag.active,launcherDrag.suppressClick=true,false
+        launcherDrag.input,launcherDrag.origin,launcherDrag.position=input,input.Position,ctx.view.reopen.Position
     end
 end))
 table.insert(connections, UIS.InputChanged:Connect(function(input)
@@ -1025,10 +1193,27 @@ table.insert(connections, UIS.InputChanged:Connect(function(input)
         local p=drag.position
         ctx.view.panel.Position = UDim2.new(p.X.Scale,p.X.Offset+d.X,p.Y.Scale,p.Y.Offset+d.Y)
     end
+    if launcherDrag.active and not ctx.view.menuOpen
+        and (input==launcherDrag.input or (launcherDrag.input.UserInputType==Enum.UserInputType.MouseButton1
+            and input.UserInputType==Enum.UserInputType.MouseMovement)) then
+        local d=input.Position-launcherDrag.origin
+        if d.Magnitude>=6 then launcherDrag.suppressClick=true end
+        if launcherDrag.suppressClick then
+            local p=launcherDrag.position
+            local camera=workspace.CurrentCamera
+            if camera then
+                local size=camera.ViewportSize
+                ctx.positionLauncher(p.X.Scale*size.X+p.X.Offset+d.X,p.Y.Scale*size.Y+p.Y.Offset+d.Y)
+            end
+        end
+    end
 end))
 table.insert(connections, UIS.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input==drag.input then drag.active=false end
+    if input==launcherDrag.input or (input.UserInputType==Enum.UserInputType.MouseButton1
+        and launcherDrag.input and launcherDrag.input.UserInputType==Enum.UserInputType.MouseButton1) then launcherDrag.active=false end
 end))
+table.insert(ctx.disposers,function() drag.active=false; launcherDrag.active=false end)
 table.insert(connections, UIS.InputBegan:Connect(function(input, processed)
     if not processed and input.KeyCode == Enum.KeyCode.F8 then
         local ok, err = pcall(snapshot, "F8 manual snapshot")
@@ -1145,6 +1330,7 @@ local cfg = ctx.cfg
 local lastSkip
 local lastSkipAt = -math.huge
 local catalogAttempts, lastCatalogAt = 0,-math.huge
+local attemptedCard,attemptedUntil
 local function active()
     return ctx.actionActive("Food")
         and not ctx.state.cinemaPending and not ctx.cinemaPrompt()
@@ -1210,10 +1396,15 @@ function ctx.foodPlan()
     return {cards=cards,card=card,current=current,index=index,price=price,owned=owned,
         cash=cash,budget=cash or 0}
 end
+function ctx.foodReady()
+    local plan=ctx.foodPlan()
+    return plan and not (attemptedCard==plan.card and os.clock()<(attemptedUntil or 0)) or false
+end
 function ctx.doFood()
     if not active() then return end
     -- Inspect existing hidden cards first. No shop trip just to discover poverty.
     local plan, reason, needsCatalog, issue = ctx.foodPlan()
+    if plan and attemptedCard==plan.card and os.clock()<(attemptedUntil or 0) then return end
     if not plan and (not needsCatalog or not canInitialize()) then skip(reason,issue); return end
     local pad = ctx.find(workspace, "LocalPlotProps.FoodShop.ActivationCircle")
     if not (pad and pad:IsA("BasePart")) then skip("Food shop location unavailable"); return end
@@ -1226,6 +1417,8 @@ function ctx.doFood()
         catalogAttempts,lastCatalogAt = catalogAttempts+1,os.clock()
         ctx.log("FOOD_CATALOG", "Initialize current food/prices; bounded attempt=" .. catalogAttempts)
     end
+    ctx.stopTraining()
+    if not active() then return end
     ctx.move(pad.Position+Vector3.new(0, 2.4, 0))
     local cards = ctx.waitFor(function()
         local c = ctx.ui("FoodShop.Main.Panel.Body.CardsScroll")
@@ -1248,6 +1441,8 @@ function ctx.doFood()
         lastSkip = nil
         ctx.log("FOOD_SELECTED", "current=Food" .. fresh.current .. " next=" .. fresh.card.Name
             .. " price=" .. fresh.price .. " cash=" .. tostring(fresh.cash))
+        attemptedCard,attemptedUntil=fresh.card,os.clock()+30
+        ctx.state.foodPurchaseSerial=(ctx.state.foodPurchaseSerial or 0)+1
         ctx.click(fresh.card:FindFirstChild("ActionButton"))
         ctx.pause(os.clock()+0.8)
         local label = ctx.find(fresh.card, "ActionButton.Label")
@@ -1314,6 +1509,36 @@ function ctx.cinemaTap(x, y, method)
     end
     log("CINEMA_INPUT_SENT", "method=" .. method .. " observedSoFar=" .. tostring(pending.observed)
         .. " (a nearby manual click can also be observed)")
+end
+function ctx.clearTapPoint(preferredX,preferredY)
+    local camera=workspace.CurrentCamera
+    if not camera then return nil end
+    local size=camera.ViewportSize
+    local inset=game:GetService("GuiService"):GetGuiInset()
+    local candidates={{preferredX or size.X*0.6,preferredY or size.Y*0.47}}
+    for _,y in ipairs({0.48,0.68,0.3}) do
+        for _,x in ipairs({0.88,0.12,0.75,0.25,0.5}) do candidates[#candidates+1]={size.X*x,size.Y*y} end
+    end
+    local function covers(obj,x,y)
+        if not obj or not obj.Visible then return false end
+        local p,s=obj.AbsolutePosition,obj.AbsoluteSize
+        return x>=p.X-8 and x<=p.X+s.X+8 and y>=p.Y-8 and y<=p.Y+s.Y+8
+    end
+    for _,point in ipairs(candidates) do
+        local x,y=math.floor(point[1]),math.floor(point[2])
+        if x>=24 and y>=24 and x<size.X-24 and y<size.Y-24
+            and not covers(ctx.view.panel,x-inset.X,y-inset.Y) and not covers(ctx.view.reopen,x-inset.X,y-inset.Y)
+            and not covers(ctx.view.petReceipt,x-inset.X,y-inset.Y) then
+            local safe=true
+            for _,hit in ipairs(ctx.pg:GetGuiObjectsAtPosition(x-inset.X,y-inset.Y)) do
+                if visible(hit) and (hit:IsA("GuiButton") or hit.Active) then
+                    local host=hit:FindFirstAncestorOfClass("ScreenGui")
+                    if not host or (host.Name~="ThrowSequence" and host.Name~="ScreenFX") then safe=false; break end
+                end
+            end
+            if safe then return x,y end
+        end
+    end
 end
 -- Resolve the existing handler without showing the panel or guessing remote arguments.
 function ctx.buttonSignal(obj)
@@ -1505,7 +1730,7 @@ function ctx.flushLog()
     return false
 end
 log("SESSION", "PlaceId=" .. game.PlaceId .. " config=" .. Http:JSONEncode(cfg))
-log("BUILD", "adonis-launcher-logo-aspect-20261110")
+log("BUILD", "adonis-blue-launcher-highlight-20261110")
 log("CAPABILITIES", "writefile=" .. type(writefile) .. " firesignal=" .. type(firesignal)
     .. " gethui=" .. type(gethui))
 task.spawn(function()
@@ -1752,6 +1977,12 @@ function ctx.plotUpgradeDiagnostics()
     if root then for _,line in ipairs(ctx.dataSample(root,8)) do result[#result+1]=line end end
     return result
 end
+function ctx.plotUpgradeReady()
+    if os.clock()<nextAttempt then return false end
+    local quote=ctx.plotUpgradeQuote()
+    local cash=quote and ctx.money()
+    return quote and cash and cash>=quote.price or false
+end
 function ctx.doPlotUpgrade()
     if not active() then return end
     local quote,reason=ctx.plotUpgradeQuote()
@@ -1804,7 +2035,7 @@ end
 -- Shared plot identity. Numeric plot names are slots, never player identity.
 return function(ctx)
 local ownerKeys={"OwnerUserId","OwnerId","Owner","PlayerUserId"}
-local function playerId(value)
+local function playerId(value,players)
     if typeof(value)=="Instance" then
         if value:IsA("Player") then return value.UserId end
         return nil
@@ -1813,7 +2044,7 @@ local function playerId(value)
     local found
     local text=type(value)=="string" and ctx.plainText(value):match("^%s*(.-)%s*$") or nil
     if text then text=text:gsub("^@","") end
-    for _,player in ipairs(ctx.services.Players:GetPlayers()) do
+    for _,player in ipairs(players or ctx.services.Players:GetPlayers()) do
         if (id and id==player.UserId) or text==player.Name or (text and text==player.DisplayName) then
             if found and found~=player.UserId then return nil end
             found=player.UserId
@@ -1897,13 +2128,13 @@ function ctx.watchPlotTag(tag,changed)
         for _,connection in pairs(tagChildConnections) do connection:Disconnect() end
     end}
 end
-function ctx.plotOwner(plot)
+function ctx.plotOwner(plot,players)
     local plots=workspace:FindFirstChild("Plots")
     if not plot or not plots or plot.Parent~=plots then return nil,"not a plot" end
     local owner,unknown,conflict
     local function accept(value)
         if value==nil or value=="" then return end
-        local id=playerId(value)
+        local id=playerId(value,players)
         if not id then unknown=true
         elseif owner and owner~=id then conflict=true
         else owner=id end
@@ -2639,8 +2870,10 @@ function ctx.doThrow()
                 local inset = game:GetService("GuiService"):GetGuiInset()
                 local screen = bar:FindFirstAncestorOfClass("ScreenGui")
                 local offset = screen and screen.IgnoreGuiInset and Vector2.new() or inset
-                clickAt(bar.AbsolutePosition.X+bar.AbsoluteSize.X/2+offset.X,
-                    bar.AbsolutePosition.Y+bar.AbsoluteSize.Y/2+offset.Y)
+                local x,y=bar.AbsolutePosition.X+bar.AbsoluteSize.X/2+offset.X,bar.AbsolutePosition.Y+bar.AbsoluteSize.Y/2+offset.Y
+                if ctx.clearTapPoint then x,y=ctx.clearTapPoint(x,y) end
+                assert(x,"No unobstructed screen point for Throw")
+                clickAt(x,y)
                 tapped = true
                 break
             end
@@ -2705,15 +2938,28 @@ end
 function ctx.doTrain(seconds)
     if not ctx.actionActive("Train") then return end
     say("Training...")
-    ctx.state.hubTraining=true
-    if not training() then
+    local turn=ctx.cfg.AllInOne and ctx.state.allInOneTurn
+    local deadline=turn and turn.trainDeadline
+    if deadline and os.clock()>=deadline then return end
+    local function enter(limit)
+        if limit and os.clock()>=limit then return false end
+        ctx.state.hubTraining=true
+        if training() then return true end
         local spot = find(workspace, "LocalPlotProps.TrainingArea.TrainingSpot")
         assert(spot and spot:IsA("BasePart"), "Training spot not found")
         move(spot.Position + Vector3.new(0, 2.4, 0))
-        waitFor(training, 8)
+        waitFor(function() return training() or (limit and os.clock()>=limit) end, 8)
+        if not training() then return false end
+        say("Training...")
+        return true
     end
-    local deadline = os.clock() + (seconds or cfg.TrainSeconds)
+    if not enter(deadline) then return end
+    deadline=deadline or os.clock()+(seconds or cfg.TrainSeconds)
+    if turn then turn.trainDeadline=deadline end
     while ctx.actionActive("Train") and os.clock() < deadline do
+        if ctx.servicePurchases then ctx.servicePurchases() end
+        if not ctx.actionActive("Train") or os.clock()>=deadline then break end
+        if not training() and not enter(deadline) then break end
         assert(training(), "Training ended unexpectedly")
         ctx.tapTrainingBonus()
         task.wait(0.08)
@@ -2726,7 +2972,7 @@ end
         ["ui"] = [=[
 -- Native Adonis shell; actions and saved settings remain in controller.
 return function(ctx)
-local W,H,SIDE,LEFT,CW=960,660,244,264,672
+local W,H,SIDE,LEFT,CW=840,600,208,232,584
 -- Monochrome black surfaces; the user's original logo retains its own colors.
 local C={base=Color3.fromRGB(0,0,0),side=Color3.fromRGB(5,5,5),card=Color3.fromRGB(17,17,17),
     line=Color3.fromRGB(55,55,55),text=Color3.fromRGB(245,245,245),muted=Color3.fromRGB(155,155,155),
@@ -2783,10 +3029,11 @@ if type(gethui)=="function" then
 end
 hosts[#hosts+1]=game:GetService("CoreGui"); hosts[#hosts+1]=ctx.pg
 for _,host in ipairs(hosts) do if pcall(function() gui.Parent=host end) and gui.Parent==host then break end end
-local panel=Instance.new("CanvasGroup",gui)
+local panel=Instance.new("Frame",gui)
 ctx.view.panel=panel
 panel.Name,panel.Size,panel.BackgroundColor3,panel.BorderSizePixel="Menu",UDim2.fromOffset(W,H),C.base,0
-panel.BackgroundTransparency,panel.GroupTransparency=0.38,0
+panel.BackgroundTransparency=0.25
+panel.ClipsDescendants=true
 round(panel,18); stroke(panel,0.3)
 local scale=Instance.new("UIScale",panel); scale.Scale=1
 local top=frame(panel,0,0,W,64,C.base); top.BackgroundTransparency=0.6; round(top,18)
@@ -2795,44 +3042,55 @@ frame(panel,0,64,W,1,C.line).BackgroundTransparency=0.65
 local side=frame(panel,0,65,SIDE,H-65,C.side); side.BackgroundTransparency=0.6; round(side,18)
 frame(side,SIDE-18,0,18,H-65,C.side).BackgroundTransparency=1
 frame(panel,SIDE,82,1,H-110,C.line).BackgroundTransparency=0.65
-local mark=frame(panel,16,8,56,48,C.base); mark.BackgroundTransparency=0.5; mark.ClipsDescendants=true; round(mark,12)
-local a=label(mark,"A",0,0,56,48,26,C.text,true); a.TextXAlignment=Enum.TextXAlignment.Center
+local logoAspect=192/151
+local markWidth,markHeight=44*logoAspect,44
+local mark=frame(panel,16,10,markWidth,markHeight,C.base); mark.BackgroundTransparency=1; mark.ClipsDescendants=true; round(mark,12)
+local a=label(mark,"A",0,0,markWidth,markHeight,26,C.text,true); a.TextXAlignment=Enum.TextXAlignment.Center
 local logo=Instance.new("ImageLabel",mark)
-logo.Name,logo.Size,logo.BackgroundTransparency,logo.ScaleType="BrandLogo",UDim2.fromOffset(56,48),1,Enum.ScaleType.Fit
+logo.Name,logo.Size,logo.BackgroundTransparency,logo.ScaleType="BrandLogo",UDim2.new(1,0,1,0),1,Enum.ScaleType.Fit
 logo.Image=ctx.brandLogo or ""; logo.Visible=logo.Image~=""; a.Visible=not logo.Visible; round(logo,12)
 local title=label(panel,"Adonis HUB",82,7,250,29,23,C.text,true)
-local subtitle=label(panel,"Throw Food For Animals",83,35,148,20,12,C.muted)
-local version=frame(panel,240,35,46,20,C.card); version.BackgroundTransparency=0.4; round(version,10); stroke(version,0.15)
+local subtitle=label(panel,"Throw Food For Animals",83,35,166,20,13,C.muted)
+subtitle.TextTruncate=Enum.TextTruncate.None
+local version=frame(panel,231,35,46,20,C.card); version.BackgroundTransparency=0.4; round(version,10); stroke(version,0.15)
 local versionText=label(version,"v1.1",0,0,46,20,11,C.text,true); versionText.TextXAlignment=Enum.TextXAlignment.Center
 version.Name="VersionBadge"
-local profile=frame(panel,18,550,212,78,C.card); profile.BackgroundTransparency=0.45; round(profile,16); stroke(profile,0.65)
+local subtitleWidth
+local function fitVersion()
+    local bounds=subtitle.TextBounds
+    local width=bounds and bounds.X and bounds.X>0 and math.ceil(bounds.X) or 166
+    if subtitleWidth~=width then subtitleWidth=width; subtitle.Size=UDim2.fromOffset(width,20) end
+    version.Position=UDim2.fromOffset(83+width+6,35)
+end
+connect(subtitle:GetPropertyChangedSignal("TextBounds"),fitVersion); fitVersion()
+local profile=frame(panel,16,500,176,70,C.card); profile.BackgroundTransparency=0.45; round(profile,16); stroke(profile,0.65)
 local user=ctx.player
 local display=user.DisplayName or user.Name
-local avatarTile=frame(profile,12,18,42,42,C.selected); round(avatarTile,21)
-local initial=label(avatarTile,display:sub(1,1):upper(),0,0,42,42,18,C.text,true)
+local avatarTile=frame(profile,10,14,38,38,C.selected); round(avatarTile,21)
+local initial=label(avatarTile,display:sub(1,1):upper(),0,0,38,38,18,C.text,true)
 initial.TextXAlignment=Enum.TextXAlignment.Center
 local avatar=Instance.new("ImageLabel",avatarTile)
-avatar.Name,avatar.Size,avatar.BackgroundTransparency="Avatar",UDim2.fromOffset(42,42),1; round(avatar,21)
+avatar.Name,avatar.Size,avatar.BackgroundTransparency="Avatar",UDim2.fromOffset(38,38),1; round(avatar,21)
 local id=tonumber(user.UserId)
 avatar.Image=id and id>0 and ("rbxthumb://type=AvatarHeadShot&id="..id.."&w=150&h=150") or ""
-label(profile,display,66,18,134,22,15,C.text,true)
-label(profile,"@"..user.Name,66,41,134,19,12,C.muted)
+label(profile,display,58,14,108,22,14,C.text,true)
+label(profile,"@"..user.Name,58,37,108,19,12,C.muted)
 label(panel,"WORKSPACE",28,142,180,20,10,C.muted,true)
-local pageTitle=label(panel,"Main Farm",LEFT+22,75,560,25,19,C.text,true)
+local pageTitle=label(panel,"Main Farm",LEFT+22,75,CW-30,25,19,C.text,true)
 label(panel,"+",LEFT,75,20,25,23,C.text,true)
 local pages,navs,indicators,navVisuals={},{},{},{}
-local statusDot=frame(panel,LEFT,640,5,5,C.muted); round(statusDot,3)
-local status=label(panel,"Ready. Turn On A Feature.",LEFT+14,626,CW-115,30,11,C.muted)
+local statusDot=frame(panel,LEFT,580,5,5,C.muted); round(statusDot,3)
+local status=label(panel,"Ready. Turn On A Feature.",LEFT+14,564,CW-115,32,13,C.muted)
 status.TextWrapped=true; status.TextTruncate=Enum.TextTruncate.None
-local activity=label(panel,"Standby",W-102,630,78,22,11,C.muted,true)
+local activity=label(panel,"Standby",W-102,570,78,22,12,C.muted,true)
 activity.TextXAlignment=Enum.TextXAlignment.Right
-label(panel,"Right Shift · Menu",26,634,200,18,11,C.muted)
+label(panel,"Right Shift · Menu",20,578,180,18,12,C.muted)
 ctx.view.gui,ctx.view.panel,ctx.view.title,ctx.view.status=gui,panel,title,status
 ctx.view.pages,ctx.view.controls,ctx.view.toggleVisuals=pages,{},{}
 ctx.view.logo,ctx.view.subtitle,ctx.view.version,ctx.view.versionText=logo,subtitle,version,versionText
 ctx.view.avatar,ctx.view.profile,ctx.view.menuOpen=avatar,profile,true
 ctx.view.activity,ctx.view.statusDot=activity,statusDot
-ctx.view.menuMetrics={width=W,height=H,contentWidth=CW,pageHeight=510}
+ctx.view.menuMetrics={width=W,height=H,contentWidth=CW,pageHeight=444}
 function ctx.refreshMenuState()
     local active=ctx.state.running==true
     activity.Text=active and "Active" or "Standby"
@@ -2893,13 +3151,13 @@ function ctx.selectMenuTab(name,instant)
 end
 for index,name in ipairs({"Main Farm","Upgrade","Auto Sell","Setting"}) do
     local page=Instance.new("ScrollingFrame",panel)
-    page.Name,page.Position,page.Size=name,UDim2.fromOffset(LEFT,106),UDim2.fromOffset(CW,510)
+    page.Name,page.Position,page.Size=name,UDim2.fromOffset(LEFT,106),UDim2.fromOffset(CW,444)
     page.BackgroundTransparency,page.BorderSizePixel,page.ScrollBarThickness=1,0,3
     page.ScrollBarImageColor3=C.line; page.ScrollingDirection=Enum.ScrollingDirection.Y
     page.CanvasSize=UDim2.fromOffset(0,0); page.ClipsDescendants=true; pages[name]=page
-    local tab=ctx.button(name,18,105+(index-1)*62,212,function() ctx.selectMenuTab(name) end,side,true)
-    tab.Size,tab.BackgroundColor3=UDim2.fromOffset(212,50),C.selected; round(tab,18)
-    local caption=label(tab,name,50,0,152,50,16,C.text,true)
+    local tab=ctx.button(name,16,105+(index-1)*56,176,function() ctx.selectMenuTab(name) end,side,true)
+    tab.Size,tab.BackgroundColor3=UDim2.fromOffset(176,46),C.selected; round(tab,18)
+    local caption=label(tab,name,46,0,120,46,16,C.text,true)
     local icon=frame(tab,16,15,20,20); icon.BackgroundTransparency=1
     local lines=glyph(icon,index)
     local marker=frame(tab,0,16,3,18,C.accent); round(marker,2)
@@ -2912,13 +3170,13 @@ for index,name in ipairs({"Main Farm","Upgrade","Auto Sell","Setting"}) do
         if ctx.view.activeTab~=name then animate(tab,{BackgroundTransparency=1}) end
     end)
 end
-local searchFrame=frame(panel,18,88,212,44,C.card); searchFrame.BackgroundTransparency=0.45; round(searchFrame,12); stroke(searchFrame,0.55)
+local searchFrame=frame(panel,16,88,176,44,C.card); searchFrame.BackgroundTransparency=0.45; round(searchFrame,12); stroke(searchFrame,0.55)
 local lens=frame(searchFrame,14,13,15,15,C.card); lens.BackgroundTransparency=1; round(lens,8); stroke(lens,0.05,C.muted)
 local stem=frame(searchFrame,27,26,7,2,C.muted); stem.Rotation=45
 local search=Instance.new("TextBox",searchFrame)
-search.Name,search.Position,search.Size="FeatureSearch",UDim2.fromOffset(42,0),UDim2.fromOffset(158,44)
+search.Name,search.Position,search.Size="FeatureSearch",UDim2.fromOffset(42,0),UDim2.fromOffset(124,44)
 search.BackgroundTransparency,search.BorderSizePixel,search.Text,search.PlaceholderText=1,0,"","Search Features"
-search.TextSize,search.Font,search.TextColor3,search.PlaceholderColor3=15,Enum.Font.BuilderSans,C.text,C.muted
+search.TextSize,search.Font,search.TextColor3,search.PlaceholderColor3=14,Enum.Font.BuilderSans,C.text,C.muted
 search.TextXAlignment,search.TextStrokeTransparency,search.ClearTextOnFocus=Enum.TextXAlignment.Left,1,false
 ctx.view.search=search
 connect(search.FocusLost,function(enter)
@@ -2932,34 +3190,67 @@ connect(search.FocusLost,function(enter)
     end
 end)
 ctx.view.navigation=navs
-local reopen=ctx.button("Open Adonis HUB",18,18,288,function() ctx.setMenuVisible(true) end,gui,true)
-reopen.Name,reopen.Visible="OpenMenu",false; reopen.Size=UDim2.fromOffset(288,62)
-reopen.BackgroundColor3,reopen.BackgroundTransparency=C.base,0.25; round(reopen,16)
-stroke(reopen,0.4,C.line)
--- Match the supplied 192x151 image exactly: no square Fit letterboxing.
-local launcherLogoWidth=44*192/151
-local launcherMark=frame(reopen,9,9,launcherLogoWidth,44,C.base); launcherMark.BackgroundTransparency=1
-launcherMark.ClipsDescendants=true; round(launcherMark,11)
-local launcherInitial=label(launcherMark,"A",0,0,launcherLogoWidth,44,22,C.text,true); launcherInitial.TextXAlignment=Enum.TextXAlignment.Center
-local launcherLogo=Instance.new("ImageLabel",launcherMark)
-launcherLogo.Name,launcherLogo.Size,launcherLogo.BackgroundTransparency,launcherLogo.ScaleType="BrandLogo",UDim2.fromOffset(launcherLogoWidth,44),1,Enum.ScaleType.Fit
+local launcherWidth,launcherHeight=52*logoAspect,52
+local reopen=ctx.button("Open Adonis HUB",18,18,launcherWidth,function()
+    if not ctx.view.launcherDrag or not ctx.view.launcherDrag.suppressClick then ctx.setMenuVisible(true) end
+end,gui,true)
+reopen.Name,reopen.Visible="OpenMenu",false; reopen.Size=UDim2.fromOffset(launcherWidth,launcherHeight)
+reopen.BackgroundTransparency,reopen.ClipsDescendants=1,true; round(reopen,12)
+local launcherBorder=stroke(reopen,0.12,Color3.fromRGB(255,255,255))
+launcherBorder.Thickness=2
+local launcherHighlight=Instance.new("UIGradient",launcherBorder)
+launcherHighlight.Name,launcherHighlight.Rotation="BlueHighlight",0
+launcherHighlight.Color=ColorSequence.new({
+    ColorSequenceKeypoint.new(0,Color3.fromRGB(12,38,78)),
+    ColorSequenceKeypoint.new(0.55,Color3.fromRGB(20,72,150)),
+    ColorSequenceKeypoint.new(0.8,Color3.fromRGB(32,144,255)),
+    ColorSequenceKeypoint.new(0.94,Color3.fromRGB(116,226,255)),
+    ColorSequenceKeypoint.new(1,Color3.fromRGB(50,169,255))})
+launcherHighlight.Enabled=false
+local highlightTween
+local function stopHighlight()
+    if highlightTween then highlightTween:Cancel(); highlightTween:Destroy(); highlightTween=nil end
+    launcherHighlight.Enabled=false
+end
+local function updateHighlight()
+    if not ctx.state.alive or not reopen.Visible then stopHighlight(); return end
+    if highlightTween then return end
+    launcherHighlight.Enabled=true
+    launcherHighlight.Rotation=0
+    if ctx.services.TweenService then
+        highlightTween=ctx.services.TweenService:Create(launcherHighlight,
+            TweenInfo.new(2.4,Enum.EasingStyle.Linear,Enum.EasingDirection.InOut,-1),{Rotation=360})
+        highlightTween:Play()
+    end
+end
+table.insert(ctx.disposers,stopHighlight)
+local launcherInitial=label(reopen,"A",0,0,launcherWidth,launcherHeight,26,C.text,true); launcherInitial.TextXAlignment=Enum.TextXAlignment.Center
+local launcherLogo=Instance.new("ImageLabel",reopen)
+launcherLogo.Name,launcherLogo.Size,launcherLogo.BackgroundTransparency,launcherLogo.ScaleType="BrandLogo",UDim2.new(1,0,1,0),1,Enum.ScaleType.Fit
 launcherLogo.Image=ctx.brandLogo or ""; launcherLogo.Visible=launcherLogo.Image~=""; launcherInitial.Visible=not launcherLogo.Visible
-round(launcherLogo,11)
-local launcherTitle=label(reopen,"THROW FOOD FOR ANIMALS",77,0,199,62,13,C.text,true)
-ctx.view.reopen,ctx.view.reopenLogo,ctx.view.reopenTitle=reopen,launcherLogo,launcherTitle
-connect(reopen.MouseEnter,function() animate(reopen,{BackgroundTransparency=0.1}) end)
-connect(reopen.MouseLeave,function() animate(reopen,{BackgroundTransparency=0.25}) end)
+round(launcherLogo,12)
+ctx.view.reopen,ctx.view.reopenLogo=reopen,launcherLogo
+ctx.view.launcherHighlight,ctx.view.launcherBorder=launcherHighlight,launcherBorder
+connect(reopen.MouseEnter,function() animate(launcherBorder,{Transparency=0.02}) end)
+connect(reopen.MouseLeave,function() animate(launcherBorder,{Transparency=0.12}) end)
+function ctx.positionLauncher(x,y)
+    local camera=workspace.CurrentCamera
+    if not camera then return end
+    local size=camera.ViewportSize
+    reopen.Position=UDim2.fromOffset(math.floor(math.clamp(x,4,math.max(4,size.X-launcherWidth-4))),
+        math.floor(math.clamp(y,4,math.max(4,size.Y-launcherHeight-4))))
+end
 function ctx.setMenuVisible(open)
     if not ctx.state.alive then return end
     if not open and ctx.view.dragState then ctx.view.dragState.active=false end
+    if ctx.view.launcherDrag then ctx.view.launcherDrag.active=false end
     ctx.view.menuOpen=open==true; panel.Visible=ctx.view.menuOpen; reopen.Visible=not ctx.view.menuOpen
-    if ctx.view.menuOpen then panel.GroupTransparency=1; animate(panel,{GroupTransparency=0})
-    elseif animations[panel] then animations[panel]:Cancel(); animations[panel]:Destroy(); animations[panel]=nil end
+    updateHighlight()
 end
 function ctx.toggleMenu() ctx.setMenuVisible(not ctx.view.menuOpen) end
-local close=ctx.button("×",904,16,30,function() ctx.setMenuVisible(false) end)
+local close=ctx.button("×",W-56,16,30,function() ctx.setMenuVisible(false) end)
 close.Name,close.TextSize="CloseMenu",21
-local minimize=ctx.button("–",864,16,30,function() ctx.setMenuVisible(false) end)
+local minimize=ctx.button("–",W-96,16,30,function() ctx.setMenuVisible(false) end)
 minimize.Name,minimize.TextSize="MinimizeMenu",17
 for _,b in ipairs({close,minimize}) do
     b.Size,b.ZIndex=UDim2.fromOffset(30,30),22
@@ -2976,8 +3267,8 @@ local function paintToggle(b,instant)
     animate(v.border,{Color=v.on and C.accent or C.line,Transparency=v.on and 0.45 or (v.hovered and 0.2 or 0.65)},instant)
 end
 function ctx.addToggle(text,description,parent,y,callback,layout)
-    local o=layout or {}; local width,height=o.width or CW,o.height or 62
-    local b=ctx.button(text,o.x or 0,y,width,callback,parent,true)
+    local o=layout or {}; local width,height=o.width or CW-8,o.height or 62
+    local b=ctx.button(text,o.x or 4,y+2,width,callback,parent,true)
     b.Size=UDim2.fromOffset(width,height); b.BackgroundColor3=description and C.hero or C.card; b.BackgroundTransparency=0.42; round(b,18)
     local border=stroke(b,0.6)
     local hero=description~=nil
@@ -3032,8 +3323,10 @@ local function fit()
     local camera=workspace.CurrentCamera; if not camera then return end
     local size=camera.ViewportSize; if size.X==lastX and size.Y==lastY then return end
     lastX,lastY=size.X,size.Y
-    scale.Scale=math.clamp(math.min(1,(size.X-32)/W,(size.Y-32)/H),0.3,1)
-    panel.Position=UDim2.fromOffset(math.max(16,(size.X-W*scale.Scale)/2),math.max(16,(size.Y-H*scale.Scale)/2))
+    scale.Scale=math.clamp(math.min(1,(size.X-48)/W,(size.Y-48)/H),0.3,1)
+    panel.Position=UDim2.fromOffset(math.floor(math.max(16,(size.X-W*scale.Scale)/2)+0.5),math.floor(math.max(16,(size.Y-H*scale.Scale)/2)+0.5))
+    local p=reopen.Position
+    ctx.positionLauncher(p.X.Scale*size.X+p.X.Offset,p.Y.Scale*size.Y+p.Y.Offset)
 end
 local function watchCamera()
     if cameraConnection then cameraConnection:Disconnect(); cameraConnection=nil end
@@ -3051,6 +3344,7 @@ end
 return function(ctx)
 local lastSkip
 local lastSkipAt = -math.huge
+local attemptedPart,attemptedPrice,attemptedUntil
 local function skip(reason)
     if reason ~= lastSkip or os.clock()-lastSkipAt >= 60 then
         ctx.log("UPGRADE_SKIP", reason); lastSkip,lastSkipAt = reason,os.clock()
@@ -3126,6 +3420,11 @@ local function affordable()
     end
     return quote
 end
+function ctx.trainingUpgradeReady()
+    local quote=affordable()
+    return quote and not (quote.part==attemptedPart and quote.price==attemptedPrice
+        and os.clock()<(attemptedUntil or 0)) or false
+end
 function ctx.doUpgrade()
     if not active() then return end
     local quote, reason, issue = affordable()
@@ -3134,6 +3433,7 @@ function ctx.doUpgrade()
         if issue ~= "funds" then ctx.dataIssue("upgrade",reason,ctx.upgradeDiagnostics) end
         return
     end
+    if not ctx.trainingUpgradeReady() then return end
     ctx.say("Training upgrade affordable; approaching...")
     ctx.closeAnimals()
     ctx.stopTraining()
@@ -3150,6 +3450,7 @@ function ctx.doUpgrade()
     lastSkip = nil
     -- Tap E once, only after a fresh affordability check at the pad.
     ctx.log("UPGRADE_PROMPT", "before=" .. current.prompt.ObjectText .. " price=" .. current.price)
+    attemptedPart,attemptedPrice,attemptedUntil=current.part,current.price,os.clock()+30
     local vim = game:GetService("VirtualInputManager")
     vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
     task.wait(0.05)
@@ -3178,13 +3479,14 @@ local function ui(...) return ctx.ui(...) end
 local function visible(...) return ctx.visible(...) end
 local function waitFor(...) return ctx.waitFor(...) end
 
-local allInOneFeatures={Train=true,X2=true,Throw=true,Equip=true,Upgrade=true,Food=true}
+local allInOneFeatures={Train=true,X2=true,Throw=true}
 function ctx.featureEnabled(name)
     local cfg=ctx.cfg or {}
     return cfg[name]==true or (cfg.AllInOne==true and allInOneFeatures[name]==true)
 end
 function ctx.actionActive(name)
     return ctx.state.alive and ctx.state.running and ctx.featureEnabled(name)
+        and not (name=="Sell" and ctx.purchaseInterruptReady and ctx.purchaseInterruptReady())
         and not (ctx.state.actionFeature==name and ctx.state.actionRevision~=ctx.state.controlRevision)
 end
 function ctx.checkAction()
