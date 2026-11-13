@@ -1,7 +1,10 @@
 local hub = "https://raw.githubusercontent.com/caubebietbuon/Misozz/main/"
 local routes = {
-    games = {},
-    places = { [120219252362013] = hub .. "Adonis-TFFA.lua" },
+    games = { [10775182046] = hub .. "AdonisHub_TAS.lua" },
+    places = {
+        [120219252362013] = hub .. "Adonis-TFFA.lua",
+        [129081220403721] = hub .. "AdonisHub_TAS.lua",
+    },
 }
 
 local address = routes.games[game.GameId] or routes.places[game.PlaceId]
