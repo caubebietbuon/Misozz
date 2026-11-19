@@ -4,6 +4,7 @@ local routes = {
     places = {
         [120219252362013] = hub .. "Adonis-TFFA.lua",
         [129081220403721] = hub .. "AdonisHub_TAS.lua",
+        [128749725449995] = hub .. "Adonis-SAFA.lua",
     },
 }
 
