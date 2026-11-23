@@ -6,6 +6,7 @@ local routes = {
         [129081220403721] = hub .. "AdonisHub_TAS.lua",
         [128749725449995] = hub .. "Adonis-SAFA.lua",
         [79546208627805] = hub .. "Adonis-99N.lua",
+        [126509999114328] = hub .. "Adonis-99N.lua",
     },
 }
 
